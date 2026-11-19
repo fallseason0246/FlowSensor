@@ -1,10 +1,10 @@
 """
-plot_flow.py — 画滤波前 / 滤波后（仿真时加真值）流量随时间变化
+plot_flow.py - plot raw / FIR flow vs time (plus true flow in sim runs).
 
-用法：
-  python3 plot_flow.py                       画 data/ 里最新的一次
-  python3 plot_flow.py sim_20261115_143707   指定某次（前缀、文件名或路径都行）
-同名的 edges_*.csv 自动配对；输出：data/ 里同名 .png
+Usage:
+  python3 plot_flow.py                       plot the latest run in data/
+  python3 plot_flow.py sim_20261115_143707   plot a given run (prefix, file name or path)
+The matching edges_*.csv is picked up automatically. Output: .png with the same name in data/.
 """
 
 import csv
@@ -19,17 +19,17 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 def find_flow_csv(arg):
-    """无参数 -> data/ 里最新的 flow_*.csv；有参数 -> 路径 / 文件名 / 前缀"""
+    """No arg -> latest data/flow_*.csv; otherwise a path, file name or prefix."""
     if arg is None:
         files = sorted(DATA_DIR.glob("flow_*.csv"), key=lambda p: p.stat().st_mtime)
         if not files:
-            sys.exit(f"{DATA_DIR} 里没有 flow_*.csv，先运行 main.py")
+            sys.exit(f"No flow_*.csv in {DATA_DIR}. Run main.py first")
         return files[-1]
     name = arg if arg.endswith(".csv") else f"{arg}.csv"
     for cand in (Path(arg), DATA_DIR / name, DATA_DIR / f"flow_{name}"):
         if cand.is_file():
             return cand
-    sys.exit(f"找不到 {arg}（查过当前目录和 {DATA_DIR}）")
+    sys.exit(f"Cannot find {arg} (checked cwd and {DATA_DIR})")
 
 
 def load(path):

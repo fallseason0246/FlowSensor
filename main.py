@@ -1,17 +1,17 @@
 """
-main.py — 1 ms 主循环：取上升沿 -> 计算流量 -> 记录 CSV
+main.py - 1 ms main loop: read edges -> compute flow -> log to CSV.
 
-用法：
-  仿真（任何电脑都能跑，虚拟时钟，几秒跑完）：
+Usage:
+  Simulation (any PC, virtual clock, finishes in seconds):
     python3 main.py --sim
-  实机（Raspberry Pi 4，GPIO16）：
+  Hardware (Raspberry Pi 4, GPIO16):
     python3 main.py --gpio --duration 20
-    python3 main.py --gpio --bias pull-up      # 不经过 BSS138、直接回环测试时
+    python3 main.py --gpio --bias pull-up      # direct loopback, no BSS138
 
-输出（都在 data/ 子文件夹，不存在时自动创建）：
-  data/flow_<mode>_<时间>.csv   每 1 ms 一行
-  data/edges_<mode>_<时间>.csv  每个上升沿一行（是否被当作毛刺丢弃）
-之后直接 python3 plot_flow.py 就会画最新这次的结果
+Output (in data/, created if missing):
+  data/flow_<mode>_<time>.csv   one row per 1 ms tick
+  data/edges_<mode>_<time>.csv  one row per rising edge (accepted or rejected as glitch)
+Then run python3 plot_flow.py to plot the latest run.
 """
 
 import argparse
@@ -20,14 +20,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from flow_core import FlowEstimator, NS_PER_S
+from flow_core import FlowEstimator, NS_PER_S, K_HZ_PER_LPM, MIN_INTERVAL_S, TIMEOUT_S
 
 LOOP_NS = 1_000_000   # 1 ms
-DATA_DIR = Path(__file__).resolve().parent / "data"   # 与运行目录无关
+DATA_DIR = Path(__file__).resolve().parent / "data"   # independent of cwd
 
 
 def process_tick(est, now_ns, new_edges, t0_ns, edge_log):
-    """主循环每一轮的处理（仿真和实机共用）"""
+    """Per-tick processing, shared by sim and hardware."""
     for ts in new_edges:
         ok = est.add_edge(ts)
         edge_log.append(((ts - t0_ns) / NS_PER_S, int(ok)))
@@ -46,20 +46,12 @@ def run_sim(est, args):
     rows, edge_log = [], []
     t0 = 0
     i = 0
-    irqsign = False
-    pending = []
     for now in range(0, duration_ns, LOOP_NS):
-        # —— 模拟“中断回调”：这 1 ms 内到达的上升沿进入队列并置位 irqsign ——
-        while i < edges_ns.size and edges_ns[i] <= now:
-            pending.append(int(edges_ns[i]))
-            i += 1
-            irqsign = True
-
-        # —— 主循环本体 ——
+        # same as GpioEdgeSource.drain(): all edges that arrived up to now
         new = []
-        if irqsign:
-            irqsign = False
-            new, pending = pending, []
+        while i < edges_ns.size and edges_ns[i] <= now:
+            new.append(int(edges_ns[i]))
+            i += 1
         q_raw, q_fir, n_win = process_tick(est, now, new, t0, edge_log)
         t_s = now / NS_PER_S
         rows.append([f"{t_s:.3f}", f"{q_raw:.2f}", f"{q_fir:.2f}", n_win,
@@ -84,7 +76,7 @@ def run_gpio(est, args):
     print(f"gpio: listening on {args.chip} line {args.line} for {args.duration} s ...")
     try:
         while next_t < end_t:
-            # 绝对时间排程：每轮目标时间 next_t += 1 ms，不累积误差
+            # absolute-time scheduling: target += 1 ms each tick, no drift
             next_t += LOOP_NS
             delay = next_t - time.monotonic_ns()
             if delay > 0:
@@ -92,10 +84,7 @@ def run_gpio(est, args):
             now = time.monotonic_ns()
             lag_us = (now - next_t) / 1000
 
-            new = []
-            if src.irqsign.is_set():
-                src.irqsign.clear()
-                new = src.drain()
+            new = src.drain()
             q_raw, q_fir, n_win = process_tick(est, now, new, t0, edge_log)
             rows.append([f"{(now - t0) / NS_PER_S:.4f}", f"{q_raw:.2f}",
                          f"{q_fir:.2f}", n_win, len(new), est.rejected,
@@ -116,16 +105,16 @@ def main():
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--sim", action="store_true")
     mode.add_argument("--gpio", action="store_true")
-    ap.add_argument("--duration", type=float, default=None, help="秒；gpio 默认 20")
+    ap.add_argument("--duration", type=float, default=None, help="seconds; gpio default 20")
     ap.add_argument("--chip", default="/dev/gpiochip0") 
     ap.add_argument("--line", type=int, default=16)
     ap.add_argument("--bias", default="disabled",
                     choices=["disabled", "pull-up", "pull-down"])
-    ap.add_argument("--k", type=float, default=98.0, help="Hz per L/min")
-    ap.add_argument("--window", type=float, default=0.200, help="FIR 窗口 s")
-    ap.add_argument("--min-interval", type=float, default=0.010, help="毛刺门限 s")
-    ap.add_argument("--timeout", type=float, default=0.500, help="判零超时 s")
-    ap.add_argument("--out", default=None, help="CSV 文件名前缀（仍存到 data/）")
+    ap.add_argument("--k", type=float, default=K_HZ_PER_LPM, help="Hz per L/min")
+    ap.add_argument("--window", type=float, default=0.200, help="FIR window, s")
+    ap.add_argument("--min-interval", type=float, default=MIN_INTERVAL_S, help="glitch threshold, s")
+    ap.add_argument("--timeout", type=float, default=TIMEOUT_S, help="zero-flow timeout, s")
+    ap.add_argument("--out", default=None, help="CSV file name prefix (still saved in data/)")
     args = ap.parse_args()
 
     est = FlowEstimator(k_hz_per_lpm=args.k, fir_window_s=args.window,

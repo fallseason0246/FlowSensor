@@ -1,75 +1,54 @@
 """
-gpio_source.py — 实机输入：用 libgpiod v2 监听 GPIO16 上升沿
+gpio_source.py - flow sensor input on a real Pi, using libgpiod v2.
 
-Python 版 libgpiod 没有真正的回调函数，这里用后台线程阻塞等待边沿事件，
-效果等同于中断回调：
-  - 收到事件 -> 内核时间戳（ns，CLOCK_MONOTONIC）放进队列
-  - 置位 irqsign，通知主循环
+The kernel timestamps each rising edge in its IRQ handler (ns, CLOCK_MONOTONIC)
+and buffers the events. drain() does a non-blocking read of that buffer once
+per main-loop tick. No thread, no queue, no locks.
 
-需要 libgpiod v2 的 Python 绑定（import gpiod; gpiod.__version__ >= 2）。
+Buffer check: max flow 0.8 L/min * K=98 -> ~78 Hz, so even a 20 ms tick
+only collects 1-2 events. The kernel buffer holds far more than that.
+
+Requires the libgpiod v2 Python binding (gpiod.__version__ >= 2).
 """
 
-import queue
-import threading
-from datetime import timedelta
-
 import sys
+from datetime import timedelta
 
 try:
     import gpiod
     from gpiod.line import Bias, Edge
 except ImportError:
-    sys.exit("实机模式需要 Linux 的 libgpiod（只能在 Raspberry Pi 上运行）。\n"
-             "在 Windows / Mac 上测试请加 --sim，例如：python count_pulse.py 10 --sim\n"
-             "已经在 Pi 上的话：先 source ~/flowenv/bin/activate，再 pip install -r requirements.txt")
+    sys.exit("Hardware mode needs Linux libgpiod (Raspberry Pi only).\n"
+             "To test on Windows / Mac add --sim, e.g. python count_pulse.py 10 --sim\n"
+             "On the Pi: source ~/flowenv/bin/activate, then pip install -r requirements.txt")
+
+BIAS = {
+    "disabled": Bias.DISABLED,   # use with BSS138 board (it has its own pull-up)
+    "pull-up": Bias.PULL_UP,
+    "pull-down": Bias.PULL_DOWN,
+}
 
 
 class GpioEdgeSource:
     def __init__(self, chip="/dev/gpiochip0", line=16, bias="disabled"):
-        bias_map = {
-            "disabled": Bias.DISABLED,   # 经过 BSS138 时用这个（板上已有上拉）
-            "pull-up": Bias.PULL_UP,
-            "pull-down": Bias.PULL_DOWN,
-        }
         self.line = line
-        self.edge_q = queue.SimpleQueue()   # 时间戳队列（线程安全）
-        self.irqsign = threading.Event()    # “中断标志”
-        self._stop = threading.Event()
-
         self.req = gpiod.request_lines(
             chip,
             consumer="flow-sensor",
-            config={
-                line: gpiod.LineSettings(
-                    edge_detection=Edge.RISING,
-                    bias=bias_map[bias],
-                    # event_clock 默认就是 MONOTONIC，与 time.monotonic_ns() 同一时钟
-                )
-            },
+            # event clock defaults to MONOTONIC, same clock as time.monotonic_ns()
+            config={line: gpiod.LineSettings(edge_detection=Edge.RISING,
+                                             bias=BIAS[bias])},
         )
-        self._th = threading.Thread(target=self._isr_thread, daemon=True)
 
     def start(self):
-        self._th.start()
-
-    def _isr_thread(self):
-        while not self._stop.is_set():
-            # 最多阻塞 100 ms，以便能响应 stop
-            if self.req.wait_edge_events(timedelta(milliseconds=100)):
-                for ev in self.req.read_edge_events():
-                    self.edge_q.put(ev.timestamp_ns)
-                self.irqsign.set()
+        """Kept for interface compatibility; edges are captured from request_lines on."""
 
     def drain(self):
-        """取出队列里所有时间戳"""
+        """Return timestamps (ns) of all edges since the last call. Never blocks."""
         out = []
-        while True:
-            try:
-                out.append(self.edge_q.get_nowait())
-            except queue.Empty:
-                return out
+        while self.req.wait_edge_events(timedelta(0)):
+            out.extend(ev.timestamp_ns for ev in self.req.read_edge_events())
+        return out
 
     def stop(self):
-        self._stop.set()
-        self._th.join(timeout=1)
         self.req.release()

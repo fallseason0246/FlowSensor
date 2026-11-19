@@ -1,47 +1,61 @@
 """
-flow_core.py — 流量计算核心（不依赖 gpiod，仿真和实机共用）
+flow_core.py - flow calculation core (no gpiod dependency, shared by sim and hardware).
 
-输入：上升沿的内核时间戳（ns，CLOCK_MONOTONIC）
-输出：滤波前流量 q_raw、FIR 滤波后流量 q_fir（mL/min）
+Input:  kernel timestamps of rising edges (ns, CLOCK_MONOTONIC)
+Output: unfiltered flow q_raw and FIR-filtered flow q_fir (mL/min)
 
-流量换算（厂家参数）：F[Hz] = K * Q[L/min]，K = 98
+Conversion: F[Hz] = K * Q[L/min]
   => Q[mL/min] = 1000 * F / K = 1e12 / (K * period_ns)
-  10.2*K ml/s
-  量程 0.3-1 L
+
+Sensor (replaced 2026-11): low-flow Hall water flow sensor, 1/4" quick connect
+  Range 0.05-0.8 L/min, DC 5 V / 10 mA max, <= 0.35 MPa, liquid <= 60 C, IP65
+  Connectors XH-3P / XH-2P
+  The datasheet gives no K (pulses/L). K_HZ_PER_LPM below is a placeholder carried
+  over from the old sensor - replace it after weigh calibration with count_pulse.py.
 """
 
 from collections import deque
 
 NS_PER_S = 1_000_000_000
 
+# ---------- sensor parameters (all scripts take their defaults from here) ----------
+K_HZ_PER_LPM = 98.0       # PLACEHOLDER - calibrate by weighing
+Q_MIN_MLMIN = 50.0        # rated min 0.05 L/min
+Q_MAX_MLMIN = 800.0       # rated max 0.8 L/min
+# Glitch threshold: at K=98 the full-scale period is ~12.8 ms and pump ripple makes it
+# shorter, so the old 10 ms was too close -> use 5 ms
+MIN_INTERVAL_S = 0.005
+# Zero timeout: at K=98 the period at min flow is ~204 ms; 0.5 s is ~2.5 periods
+TIMEOUT_S = 0.500
+
 
 class FlowEstimator:
     def __init__(self,
-                 k_hz_per_lpm: float = 98.0,     # 厂家系数，标定后替换
-                 fir_window_s: float = 0.200,    # FIR 时间窗口
-                 min_interval_s: float = 0.010,  # 小于此间隔视为毛刺
-                 timeout_s: float = 0.500,       # 超过此时间无上升沿 => 流量 0
+                 k_hz_per_lpm: float = K_HZ_PER_LPM,
+                 fir_window_s: float = 0.200,             # FIR time window
+                 min_interval_s: float = MIN_INTERVAL_S,  # shorter interval = glitch
+                 timeout_s: float = TIMEOUT_S,            # no edge for this long => flow 0
                  max_edges: int = 256):
         self.k = k_hz_per_lpm
         self.win_ns = int(fir_window_s * NS_PER_S)
         self.min_ns = int(min_interval_s * NS_PER_S)
         self.timeout_ns = int(timeout_s * NS_PER_S)
 
-        self.edges = deque(maxlen=max_edges)   # 已接受的上升沿时间戳
-        self.last_interval_ns = None           # 最近一个有效间隔
+        self.edges = deque(maxlen=max_edges)   # accepted edge timestamps
+        self.last_interval_ns = None           # latest valid interval
         self.accepted = 0
         self.rejected = 0
 
-    # ---------- 换算 ----------
+    # ---------- conversion ----------
     def q_from_period(self, period_ns: float) -> float:
-        """周期(ns) -> 流量(mL/min)"""
+        """period (ns) -> flow (mL/min)"""
         if period_ns <= 0:
             return 0.0
         return 1e12 / (self.k * period_ns)
 
-    # ---------- 输入 ----------
+    # ---------- input ----------
     def add_edge(self, ts_ns: int) -> bool:
-        """加入一个上升沿；返回 True 表示接受，False 表示当作毛刺丢弃"""
+        """Add one rising edge. Returns True if accepted, False if dropped as a glitch."""
         if self.edges:
             dt = ts_ns - self.edges[-1]
             if dt < self.min_ns:
@@ -52,26 +66,27 @@ class FlowEstimator:
         self.accepted += 1
         return True
 
-    # ---------- 输出 ----------
+    # ---------- output ----------
     def _timed_out(self, now_ns: int) -> bool:
         return (not self.edges) or (now_ns - self.edges[-1] > self.timeout_ns)
 
     def raw(self, now_ns: int) -> float:
-        """滤波前：最近一个间隔直接换算，保持到下一个上升沿"""
+        """Unfiltered: convert the latest interval directly, hold until the next edge."""
         if self.last_interval_ns is None or self._timed_out(now_ns):
             return 0.0
         return self.q_from_period(self.last_interval_ns)
 
     def fir(self, now_ns: int):
         """
-        FIR（时间窗口滑动平均）：
-          窗口 [now - win, now] 内有 n>=2 个上升沿时，
-          平均周期 = (t_最新 - t_最早) / (n - 1)
-          不足 2 个时，退回用最近两个上升沿。
-        另外：距上一个上升沿的时间若已超过平均周期，
-          把“此刻”当作一个虚拟上升沿重新求平均（流量上限），
-          让流量下降时读数能及时往下走，又不会被单个偏长的间隔拉低。
-        返回 (q_fir, n_in_window)
+        FIR (moving average over a time window):
+          With n >= 2 edges in [now - win, now],
+          mean period = (t_newest - t_oldest) / (n - 1).
+          With fewer than 2, fall back to the last two edges.
+        Also: if the time since the last edge already exceeds the mean period,
+          treat "now" as a virtual edge and re-average (an upper bound on flow).
+          This lets the reading fall promptly when flow drops, without being
+          pulled down by a single long interval.
+        Returns (q_fir, n_in_window)
         """
         if len(self.edges) < 2 or self._timed_out(now_ns):
             return 0.0, 0
@@ -79,7 +94,7 @@ class FlowEstimator:
         t0 = now_ns - self.win_ns
         n = 0
         first = None
-        for ts in reversed(self.edges):     # 从新到旧
+        for ts in reversed(self.edges):     # newest to oldest
             if ts < t0:
                 break
             first = ts
@@ -92,8 +107,8 @@ class FlowEstimator:
             n_int = n - 1
         period = (last - first) / n_int
 
-        # 等待下一个上升沿的时间已超过平均周期：
-        # 假设“此刻”刚好来一个上升沿，重新求平均周期（流量上限），读数平滑下降
+        # Waiting longer than the mean period: assume an edge arrives right now and
+        # re-average (upper bound on flow), so the reading decays smoothly
         elapsed = now_ns - last
         if elapsed > period:
             period = (now_ns - first) / (n_int + 1)

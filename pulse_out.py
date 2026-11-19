@@ -1,19 +1,19 @@
 """
-pulse_out.py — 实机回环测试：在 GPIO7 上输出和仿真相同的测试脉冲序列
+pulse_out.py - hardware loopback test: output the sim test pulse train on GPIO7.
 
-接线：GPIO7（物理 26 脚，PiTFT 侧边排针）用杜邦线直接接 GPIO16（物理 36 脚），
-     测试时不经过 BSS138。
+Wiring: jumper GPIO7 (pin 26, PiTFT side header) directly to GPIO16 (pin 36).
+        No BSS138 in this test.
 
-用法（开两个终端）：
-  终端 1：python3 main.py --gpio --bias pull-down --duration 16
-  终端 2：python3 pulse_out.py
-然后：python3 plot_flow.py flow_gpio_xxx.csv edges_gpio_xxx.csv
+Usage (two terminals):
+  Terminal 1: python3 main.py --gpio --bias pull-down --duration 16
+  Terminal 2: python3 pulse_out.py
+Then: python3 plot_flow.py
 
-说明：
-  - 用 busy-wait 控制时间，Python 抖动约几十 µs，相对 30 ms 级的周期可以忽略。
-  - 每个脉冲高电平 1 ms，毛刺脉冲高电平 100 µs。
-  - GPIO7 若被 spidev0.1 占用会报 "Device or resource busy"，
-    在 config.txt 加 dtoverlay=spi0-1cs 或换一个空闲脚（--line）。
+Notes:
+  - Timing uses busy-wait. Python jitter is tens of us, negligible vs ~30 ms periods.
+  - Normal pulse high time 1 ms, glitch pulse high time 100 us.
+  - If GPIO7 is held by spidev0.1 you get "Device or resource busy".
+    Add dtoverlay=spi0-1cs to config.txt or pick a free pin (--line).
 """
 
 import argparse
@@ -40,7 +40,7 @@ def main():
         config={args.line: gpiod.LineSettings(direction=Direction.OUTPUT,
                                                output_value=Value.INACTIVE)})
     print(f"output {edges_ns.size} edges on line {args.line} ...")
-    t0 = time.monotonic_ns() + 500_000_000   # 0.5 s 后开始
+    t0 = time.monotonic_ns() + 500_000_000   # start in 0.5 s
     try:
         for e in edges_ns.tolist():
             target = t0 + e
