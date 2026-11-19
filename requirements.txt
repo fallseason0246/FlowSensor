@@ -1,0 +1,15 @@
+# FlowSensor — Python 依赖
+# 用法（Debian / Raspberry Pi OS，在虚拟环境里）：
+#   sudo apt install -y python3-venv python3-dev build-essential gpiod
+#   python3 -m venv ~/flowenv
+#   source ~/flowenv/bin/activate
+#   pip install -r requirements.txt
+#
+# 新增或升级依赖时，在这里改，并在 README 的“依赖”一节同步说明。
+
+numpy>=1.24
+matplotlib>=3.6
+
+# libgpiod v2 的 Python 绑定（只在 Linux 实机上需要；仿真模式不用）
+# pip 包自带 libgpiod 源码，会在本机编译，所以需要 python3-dev 和 build-essential
+gpiod>=2.0 ; sys_platform == "linux"
